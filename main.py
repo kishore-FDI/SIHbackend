@@ -1,37 +1,30 @@
+from flask import Flask, request, jsonify, send_file
 import tensorflow as tf
 import tensorflow_hub as hub
 import numpy as np
-import imageio
-from PIL import Image
+from moviepy.editor import ImageSequenceClip
 import os
-import warnings
-import logging
-from typing import Generator, Iterable, List
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-logging.getLogger('tensorflow').setLevel(logging.ERROR)
-warnings.filterwarnings("ignore")
 
-_UINT8_MAX_F = float(np.iinfo(np.uint8).max)
+app = Flask(__name__)
 
-def load_image(image_path: str):
-    image_data = tf.io.read_file(image_path)
-    image = tf.io.decode_jpeg(image_data, channels=3)
-    image_numpy = tf.cast(image, dtype=tf.float32).numpy()
-    return image_numpy / _UINT8_MAX_F
+# Load the FLIM model once when the app starts
+model = hub.load("https://tfhub.dev/google/film/1")
 
+# Function to resize the images
 def resize_image(image, target_height, target_width):
     return tf.image.resize(image, [target_height, target_width])
 
-def save_frames_as_video(frames, video_path, fps=3):
-    with imageio.get_writer(video_path, fps=fps) as writer:
-        for frame in frames:
-            frame_uint8 = (frame * 255).astype(np.uint8)  # Convert frame to uint8
-            writer.append_data(frame_uint8)
+# Function to load and decode images
+_UINT8_MAX_F = float(np.iinfo(np.uint8).max)
 
+def load_image(img_path: str):
+    image_data = tf.io.read_file(img_path)
+    image = tf.io.decode_image(image_data, channels=3)
+    image_numpy = tf.cast(image, dtype=tf.float32).numpy()
+    return image_numpy / _UINT8_MAX_F
+
+# Wrapper class and functions for frame interpolation
 def _pad_to_align(x, align):
-    assert np.ndim(x) == 4
-    assert align > 0, 'align must be a positive number.'
-
     height, width = x.shape[-3:-1]
     height_to_pad = (align - height % align) if height % align != 0 else 0
     width_to_pad = (align - width % align) if width % align != 0 else 0
@@ -53,7 +46,7 @@ def _pad_to_align(x, align):
 
 class Interpolator:
     def __init__(self, align: int = 64) -> None:
-        self._model = hub.load("https://tfhub.dev/google/film/1")
+        self._model = model
         self._align = align
 
     def __call__(self, x0: np.ndarray, x1: np.ndarray, dt: np.ndarray) -> np.ndarray:
@@ -67,9 +60,9 @@ class Interpolator:
 
         if self._align is not None:
             image = tf.image.crop_to_bounding_box(image, **bbox_to_crop)
-        return image.numpy()
+        return image
 
-def _recursive_generator(frame1: np.ndarray, frame2: np.ndarray, num_recursions: int, interpolator: Interpolator) -> Generator[np.ndarray, None, None]:
+def _recursive_generator(frame1: np.ndarray, frame2: np.ndarray, num_recursions: int, interpolator: Interpolator):
     if num_recursions == 0:
         yield frame1
     else:
@@ -78,36 +71,55 @@ def _recursive_generator(frame1: np.ndarray, frame2: np.ndarray, num_recursions:
         yield from _recursive_generator(frame1, mid_frame, num_recursions - 1, interpolator)
         yield from _recursive_generator(mid_frame, frame2, num_recursions - 1, interpolator)
 
-def interpolate_recursively(frames: List[np.ndarray], num_recursions: int, interpolator: Interpolator) -> Iterable[np.ndarray]:
+def interpolate_recursively(frames, num_recursions: int, interpolator: Interpolator):
     n = len(frames)
     for i in range(1, n):
         yield from _recursive_generator(frames[i - 1], frames[i], num_recursions, interpolator)
     yield frames[-1]
 
-# Paths to the images
-image_1_url = "D:/PROJECTS/SIH/Backend/cloud1.jpg"
-image_2_url = "D:/PROJECTS/SIH/Backend/cloud2.jpg"
+@app.route('/generate_video', methods=['POST'])
+def generate_video():
+    if 'image1' not in request.files or 'image2' not in request.files:
+        return jsonify({"error": "Please upload both images"}), 400
+    
+    image1_file = request.files['image1']
+    image2_file = request.files['image2']
+    
+    # Save uploaded images to temporary files
+    image1_path = 'image1.png'
+    image2_path = 'image2.png'
+    image1_file.save(image1_path)
+    image2_file.save(image2_path)
+    
+    # Load the images
+    image1 = load_image(image1_path)
+    image2 = load_image(image2_path)
 
-# Time array
-time = np.array([0.5], dtype=np.float32)
+    # Resize images to the same shape
+    target_height, target_width = min(image1.shape[0], image2.shape[0]), min(image1.shape[1], image2.shape[1])
+    image1 = resize_image(image1, target_height, target_width)
+    image2 = resize_image(image2, target_height, target_width)
 
-# Load images
-image1 = load_image(image_1_url)
-image2 = load_image(image_2_url)
+    # Interpolation
+    interpolator = Interpolator()
+    input_frames = [image1, image2]
+    times_to_interpolate = 1
+    frames = list(interpolate_recursively(input_frames, times_to_interpolate, interpolator))
 
-# Ensure both images have the same dimensions
-target_height, target_width = image1.shape[:2]
-image2 = resize_image(image2, target_height, target_width)
+    # Convert Tensor frames to NumPy arrays and then to uint8 format for saving
+    frames_uint8 = [(frame.numpy() * 255).astype(np.uint8) for frame in frames]
 
-# Create an interpolator instance
-times_to_interpolate = 6
-interpolator = Interpolator()
+    # Save the video
+    output_video_path = 'output_video.mp4'
+    clip = ImageSequenceClip(frames_uint8, fps=60)
+    clip.write_videofile(output_video_path, codec="libx264")
 
-# Generate interpolated frames
-input_frames = [image1, image2]
-frames = list(interpolate_recursively(input_frames, times_to_interpolate, interpolator))
+    # Clean up the images
+    os.remove(image1_path)
+    os.remove(image2_path)
 
-# Save the frames as a video in mp4 format
-save_frames_as_video(frames, "interpolated_video.mp4", fps=30)
+    # Send the video file as a response
+    return send_file(output_video_path, as_attachment=True)
 
-print(f'video with {len(frames)} frames')
+if __name__ == '__main__':
+    app.run(debug=True)
